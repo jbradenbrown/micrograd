@@ -5,14 +5,17 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 256
-block_size = 8
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-3
+batch_size = 64
+block_size = 256
+max_iters = 5000
+eval_interval = 500
+learning_rate = 3e-4
 device = 'mps'
 eval_iters = 200
-n_embed = 32
+n_embed = 384
+n_layer = 6
+n_head = 6
+dropout = 0.2
 
 torch.manual_seed(1337)
 
@@ -66,7 +69,8 @@ class FeedForward(nn.Module):
     self.net = nn.Sequential(
       nn.Linear(n_embed, 4 * n_embed),
       nn.ReLU(),
-      nn.Linear(4 * n_embed, n_embed)
+      nn.Linear(4 * n_embed, n_embed),
+      nn.Dropout(dropout)
     )
 
   def forward(self, x):
@@ -81,12 +85,8 @@ class BigramLanguageModel(nn.Module):
     # self.sa_head = MultiHeadAttention(4, n_embed//4)
     # self.ffwd = FeedForward(n_embed)
 
-    self.blocks = nn.Sequential(
-      Block(n_embed, n_head=4),
-      Block(n_embed, n_head=4),
-      Block(n_embed, n_head=4),
-    )
-
+    self.blocks = nn.Sequential(*[Block(n_embed, n_head) for _ in range(n_layer)])
+    self.ln_f = nn.LayerNorm(n_embed)
     self.lm_head = nn.Linear(n_embed, vocab_size)
     
   def forward(self, idx, targets=None):
@@ -126,7 +126,8 @@ class Head(nn.Module):
     self.query = nn.Linear(n_embed, head_size, bias=False)
     self.value = nn.Linear(n_embed, head_size, bias=False)
     self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-  
+    self.dropout = nn.Dropout(dropout)
+
   def forward(self, x):
     B,T,C = x.shape
     k = self.key(x)
@@ -135,6 +136,7 @@ class Head(nn.Module):
     wei = q @ k.transpose(-2, -1) * C**-0.5
     wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
     wei = F.softmax(wei, dim=-1)
+    wei = self.dropout(wei)
 
     v = self.value(x)
     out = wei @ v
@@ -145,10 +147,11 @@ class MultiHeadAttention(nn.Module):
     super().__init__()
     self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
     self.proj = nn.Linear(n_embed, n_embed)
+    self.dropout = nn.Dropout(dropout)
 
   def forward(self, x):
     out = torch.cat([h(x) for h in self.heads], dim=-1)
-    out = self.proj(out)
+    out = self.dropout(self.proj(out))
     return out
 
 class Block(nn.Module):
@@ -158,10 +161,12 @@ class Block(nn.Module):
     head_size = n_embed // n_head
     self.sa = MultiHeadAttention(n_head, head_size)
     self.ffwd = FeedForward(n_embed)
+    self.ln1 = nn.LayerNorm(n_embed)
+    self.ln2 = nn.LayerNorm(n_embed)
 
   def forward(self, x):
-    x = x + self.sa(x)
-    x = x + self.ffwd(x)
+    x = x + self.sa(self.ln1(x))
+    x = x + self.ffwd(self.ln2(x))
     return x
 
 model = BigramLanguageModel()
@@ -184,3 +189,5 @@ for iter in range(max_iters):
 
 context = torch.zeros((1,1), dtype=torch.long, device=device)
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+
+torch.save(m, 'trained_shakespeare.pkl')
